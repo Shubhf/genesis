@@ -68,26 +68,34 @@ class EventMemory:
         return None
 
 memory = EventMemory(max_events=50)
-def retrieve_relevant_images(query: str, memory: EventMemory, k=2):
+def retrieve_relevant_images(query: str, memory: EventMemory, k=3):
+    query_tokens = tokenize(query)
+
     scored = []
 
-    q = query.lower()
     for event in memory.events:
         if "image" not in event.modalities:
             continue
 
-        ocr = event.semantics["image"].get("ocr_text", "").lower()
+        ocr = event.semantics["image"].get("ocr_text", "")
         if not ocr:
             continue
 
-        # naive score = keyword overlap
-        score = sum(1 for w in q.split() if w in ocr)
+        ocr_tokens = tokenize(ocr)
+        overlap = len(query_tokens & ocr_tokens)
 
-        if score > 0:
-            scored.append((score, event))
+        scored.append((overlap, event))
+
+    # if NOTHING matches lexically, fall back to recent images
+    if not any(score > 0 for score, _ in scored):
+        return [
+            e for e in memory.events if "image" in e.modalities
+        ][-k:]
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [e for _, e in scored[:k]]
+    return [e for score, e in scored[:k] if score > 0]
+
+
 
 
 def retrieve_evidence(query: str, memory: EventMemory):
@@ -195,10 +203,18 @@ INTENT_KEYWORDS = {
 
 def detect_intent(text):
     t = text.lower()
-    for intent, kws in INTENT_KEYWORDS.items():
-        if any(k in t for k in kws):
-            return intent
+
+    if any(k in t for k in ["what is", "what does", "read", "say", "written", "summarize", "explain"]):
+        return "ask_image"
+
+    if any(k in t for k in ["this", "that", "shown", "above"]):
+        return "reference"
+
+    if any(k in t for k in ["show", "open", "do"]):
+        return "command"
+
     return "unknown"
+
 
 # ======================
 # REFERENCE DETECTION
@@ -305,41 +321,30 @@ def build_grounded_prompt(event: Event, memory: EventMemory):
     voice = event.semantics["voice"]
     query = voice["transcript"]
 
-    image_events = retrieve_relevant_images(query, memory, k=3)
+    image_events = retrieve_relevant_images(query, memory)
 
     evidence_blocks = []
 
     for i, img_event in enumerate(image_events):
-        img_sem = img_event.semantics["image"]
-        ocr = img_sem.get("ocr_text", "").strip()
-        path = os.path.basename(img_sem.get("path", "unknown"))
-
-        block = f"[IMAGE {i+1}]\n"
-        block += f"Source: {path}\n"
-
+        ocr = img_event.semantics["image"].get("ocr_text", "").strip()
         if ocr:
-            block += f"OCR Text:\n{ocr}\n"
-        else:
-            block += "OCR Text: <no readable text>\n"
-
-        evidence_blocks.append(block)
+            evidence_blocks.append(
+                f"[IMAGE {i+1} OCR]\n{ocr}"
+            )
 
     evidence_text = (
         "\n\n".join(evidence_blocks)
         if evidence_blocks
-        else "No relevant image evidence was retrieved."
+        else "No relevant evidence found."
     )
 
     prompt = f"""
 SYSTEM:
 You are a grounded multimodal assistant.
-
-Rules you MUST follow:
-- Use ONLY the evidence provided below.
-- Do NOT use outside knowledge.
-- If the evidence does not contain the answer, say exactly: "I don't know."
-- If multiple images are provided, reason over them carefully.
-- Do not guess or infer unstated visual details.
+You must ground your answer in the evidence.
+If evidence exists, summarize it.
+If no evidence exists, say "I don't know".
+If the question is vague, summarize what the evidence shows.
 
 EVIDENCE:
 {evidence_text}
@@ -348,30 +353,47 @@ USER QUESTION:
 {query}
 
 TASK:
-Answer the question using only the evidence.
-If the answer is not explicitly supported, respond with "I don't know."
+Answer the question using only the evidence above.
 """
-
     return prompt.strip()
 
 
 
 
 def generate_response(event: Event, memory: EventMemory):
+    query = event.semantics["voice"]["transcript"]
+
+    image_events = retrieve_relevant_images(query, memory)
+
+    if not image_events:
+        return "I don't know."
+
+    # Deterministic read if OCR is strong
+    strong_ocr = [
+        e for e in image_events
+        if len(e.semantics["image"].get("ocr_text", "")) > 20
+    ]
+
+    if strong_ocr and event.semantics["voice"]["intent"] in {"ask_image", "reference"}:
+        texts = [e.semantics["image"]["ocr_text"] for e in strong_ocr]
+        return "Here is what I can read from the image:\n" + "\n\n".join(texts)
+
+    # Otherwise use LLM to summarize grounded evidence
     prompt = build_grounded_prompt(event, memory)
     return call_llm(prompt)
 
 
 
-add_image_event("/Users/shubhgarg/Downloads/amul.jpeg")
-add_image_event("/Users/shubhgarg/Downloads/amul_1.jpg")
-add_image_event("/Users/shubhgarg/Downloads/amul_4.jpeg")
-add_image_event("/Users/shubhgarg/Downloads/amul_5.jpeg")
-add_image_event("/Users/shubhgarg/Downloads/amul_6.jpeg")
-add_image_event("/Users/shubhgarg/Downloads/amul_7.jpeg")
-add_image_event("/Users/shubhgarg/Downloads/amul_8.jpeg")
-add_image_event("/Users/shubhgarg/Downloads/amul_9.jpeg")
-add_image_event("/Users/shubhgarg/Downloads/amul_10.jpg")
+
+add_image_event("/Users/shubhgarg/Downloads/ss.png")
+add_image_event("/Users/shubhgarg/Downloads/sssss.png")
+add_image_event("/Users/shubhgarg/Downloads/some_SS.png")
+#add_image_event("/Users/shubhgarg/Downloads/text_4.jpg")
+#add_image_event("/Users/shubhgarg/Downloads/text_5.jpg")
+#add_image_event("/Users/shubhgarg/Downloads/amul_7.jpeg")
+#add_image_event("/Users/shubhgarg/Downloads/amul_8.jpeg")
+#add_image_event("/Users/shubhgarg/Downloads/amul_9.jpeg")
+#add_image_event("/Users/shubhgarg/Downloads/amul_10.jpg")
 
 
 
